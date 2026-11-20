@@ -1,0 +1,165 @@
+"""
+DRIM 多标签分类主训练脚本(心脏病6类)
+用你的三模态数据 + DRIM 的对抗 disentangle 框架。
+"""
+import os
+import random
+from collections import defaultdict
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from omegaconf import OmegaConf
+from torch.utils.data import DataLoader, Dataset
+
+from drim.helpers import get_encoder
+from drim.multimodal import MultimodalDataset, DRIMSurv
+from drim.models import MultimodalWrapper, Discriminator
+from drim.losses import ContrastiveLoss
+from drim.fusion import MaskedAttentionFusion
+from drim.cls_trainer import DRIMClsTrainer
+from drim.ehr import EHRDataset
+from drim.ecg import ECGDataset
+from drim.text import TextDataset
+from drim.logger import logger
+
+OUT = "/home/featurize/data/output"
+
+
+def seed_everything(seed):
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def seed_worker(worker_id):
+    s = torch.initial_seed() % 2**32
+    np.random.seed(s)
+    random.seed(s)
+
+
+class LabelDataset(Dataset):
+    """把 MultimodalDataset 和多热标签打包,返回 ((x,mask), y)"""
+    def __init__(self, mm_dataset, labels):
+        self.mm = mm_dataset
+        self.labels = torch.from_numpy(labels).float()
+
+    def __len__(self):
+        return len(self.mm)
+
+    def __getitem__(self, idx):
+        return self.mm[idx], self.labels[idx]
+
+
+def build_split(df_split, modalities):
+    datasets = {}
+    if "EHR" in modalities:
+        datasets["EHR"] = EHRDataset(df_split, f"{OUT}/drfuse_input", return_mask=True)
+    if "ECG" in modalities:
+        datasets["ECG"] = ECGDataset(df_split, f"{OUT}/ecg_waveforms.h5", return_mask=True)
+    if "TEXT" in modalities:
+        datasets["TEXT"] = TextDataset(df_split, f"{OUT}/text_embeddings.npy", return_mask=True)
+    mm = MultimodalDataset(datasets, return_mask=True)
+    labels = df_split[[f"label_{i}" for i in range(6)]].values.astype(np.float32)
+    return LabelDataset(mm, labels)
+
+
+def main():
+    cfg = OmegaConf.load("configs/cardiac.yaml")
+    seed_everything(cfg.general.seed)
+    modalities = list(cfg.general.modalities)
+    logger.info(f"Modalities: {modalities}")
+
+    # ── 读索引表,按 split 分 ─────────────────────────────────────
+    df = pd.read_csv(f"{OUT}/cardiac_drim.csv")
+    df_tr = df[df.split == "train"].reset_index(drop=True)
+    df_va = df[df.split == "val"].reset_index(drop=True)
+    df_te = df[df.split == "test"].reset_index(drop=True)
+    logger.info(f"train/val/test = {len(df_tr)}/{len(df_va)}/{len(df_te)}")
+
+    train_data = build_split(df_tr, modalities)
+    val_data   = build_split(df_va, modalities)
+    test_data  = build_split(df_te, modalities)
+
+    dl_kwargs = dict(cfg.dataloader)
+    dataloaders = {
+        "train": DataLoader(train_data, shuffle=True,  worker_init_fn=seed_worker, **dl_kwargs),
+        "val":   DataLoader(val_data,   shuffle=False, worker_init_fn=seed_worker, **dl_kwargs),
+        "test":  DataLoader(test_data,  shuffle=False, worker_init_fn=seed_worker, **dl_kwargs),
+    }
+
+    # ── 编码器(shared + unique 各一套)────────────────────────────
+    encoders, encoders_u = {}, {}
+    for m in modalities:
+        encoders[m]   = get_encoder(m, cfg).cuda()
+        encoders_u[m] = get_encoder(m, cfg).cuda()
+
+    # ── 双层融合 ─────────────────────────────────────────────────
+    fusion_s = MaskedAttentionFusion(dim=cfg.general.dim, dropout=cfg.general.dropout,
+                                     **cfg.fusion.params).cuda()
+    fusion_u = MaskedAttentionFusion(dim=cfg.general.dim, dropout=cfg.general.dropout,
+                                     **cfg.fusion.params).cuda()
+
+    encoder = DRIMSurv(encoders_sh=encoders, encoders_u=encoders_u,
+                       fusion_s=fusion_s, fusion_u=fusion_u)
+    model = MultimodalWrapper(encoder, embedding_dim=cfg.general.dim,
+                              n_outs=cfg.general.n_outs)
+
+    # ── 判别器(每模态一个,输入 shared+unique 拼接 = dim*2)─────────
+    discriminators = {
+        k: Discriminator(embedding_dim=cfg.general.dim * 2,
+                         dropout=cfg.general.dropout).cuda()
+        for k in encoders.keys()
+    }
+
+    # ── 优化器 ───────────────────────────────────────────────────
+    optimizer = torch.optim.AdamW(model.parameters(), **cfg.optimizer.params)
+    optimizers_dsm = {
+        k: torch.optim.AdamW(discriminators[k].parameters(),
+                             lr=cfg.disentangled.dsm_lr,
+                             weight_decay=cfg.disentangled.dsm_wd)
+        for k in encoders.keys()
+    }
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, **cfg.scheduler)
+
+    # ── 损失:分类 BCE + 对比对齐 ─────────────────────────────────
+    task_criterion = nn.BCEWithLogitsLoss()
+    aux_loss = ContrastiveLoss()
+
+    trainer = DRIMClsTrainer(
+        model=model, discriminators=discriminators,
+        optimizer=optimizer, optimizers_dsm=optimizers_dsm,
+        scheduler=scheduler, task_criterion=task_criterion,
+        dataloaders=dataloaders, cfg=cfg, wandb_logging=False,
+        aux_loss=aux_loss,
+    )
+
+    os.makedirs("./models", exist_ok=True)
+    trainer.fit()
+
+    print("\n" + "=" * 55)
+    val_logs = trainer.evaluate("val")
+    test_logs = trainer.evaluate("test")
+    print("=" * 55)
+    print("DRIM 基线结果:")
+    print(f"  Val  PRAUC: {val_logs['PRAUC']:.4f}  AUROC: {val_logs['AUROC']:.4f}")
+    print(f"  Test PRAUC: {test_logs['PRAUC']:.4f}  AUROC: {test_logs['AUROC']:.4f}")
+    print("=" * 55)
+
+    CLASSES = ['Ischemic HD', 'Heart Failure', 'Arrhythmia',
+               'Cardiomyopathy', 'Endocarditis', 'Inflammatory & Other']
+    pc = getattr(trainer, 'last_per_class', {})
+    if pc:
+        print("per-class (test):")
+        for c, (ap, roc, n_pos) in sorted(pc.items()):
+            name = CLASSES[c] if c < len(CLASSES) else f'class_{c}'
+            print(f"  {name:<22} PRAUC {ap:.4f}  AUROC {roc:.4f}  n_pos {n_pos}")
+        print("=" * 55)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,193 @@
+"""
+DRIM 多标签分类训练器
+继承 DRIM 的对抗 disentangle 核心(shared对比损失 + unique判别器对抗),
+只把生存预测任务换成 6 类多标签分类。
+"""
+from collections import defaultdict
+import numpy as np
+import torch
+import torch.nn as nn
+import tqdm
+from sklearn.metrics import average_precision_score, roc_auc_score
+
+from drim.trainers import _BaseTrainer
+from drim.losses import DiscriminatorLoss
+
+
+class DRIMClsTrainer(_BaseTrainer):
+    def __init__(self, model, discriminators, optimizer, optimizers_dsm,
+                 scheduler, task_criterion, dataloaders, cfg, wandb_logging,
+                 aux_loss):
+        super().__init__(model, optimizer, scheduler, task_criterion,
+                         dataloaders, cfg, wandb_logging)
+        self.discriminators = discriminators
+        self.optimizers_dsm = optimizers_dsm
+        self.aux_loss = aux_loss
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.discriminator_loss = DiscriminatorLoss()
+        self.prefix = "DRIMCls_"
+
+    def compute_cls_metrics(self, logits_list, labels_list):
+        """多标签分类指标:macro PRAUC / AUROC"""
+        logits = torch.cat(logits_list, dim=0).float()
+        labels = torch.cat(labels_list, dim=0).float().cpu().numpy()
+        probs = torch.sigmoid(logits).cpu().numpy()
+
+        n_cls = labels.shape[1]
+        praucs, aurocs = [], []
+        for c in range(n_cls):
+            if labels[:, c].sum() > 0:  # 该类有正样本才算
+                praucs.append(average_precision_score(labels[:, c], probs[:, c]))
+                aurocs.append(roc_auc_score(labels[:, c], probs[:, c]))
+        return {
+            "PRAUC": float(np.mean(praucs)),
+            "AUROC": float(np.mean(aurocs)),
+        }
+
+    def shared_loop(self, split):
+        self.put_model_on_correct_mode(split)
+        raw_logits, all_labels = [], []
+        total_task_loss = 0.0
+        total_sh_loss = 0.0
+        total_u_loss = 0.0
+        total_dsm_loss = {k: 0.0 for k in self.optimizers_dsm.keys()}
+        n = 0
+
+        for batch in tqdm.tqdm(self.dataloaders[split]):
+            data, y = batch                      # 分类:标签 y 而非 time/event
+            data, mask = data
+            y = y.float().to(self.device)
+
+            outputs, emb_sh, emb_u = self.model(data, mask, return_embedding=True)
+
+            # ── 任务损失:多标签 BCE ──────────────────────────────
+            task_loss = self.task_criterion(outputs, y.to(outputs.device))
+
+            # ── shared 对比损失(跨模态对齐,DRIM原样)──────────────
+            sh_loss = self.aux_loss(
+                {k: v.to(self.device) for k, v in emb_sh.items()},
+                {k: v.to(self.device) for k, v in mask.items()},
+            )
+
+            # ── unique 对抗损失(模态内分离,DRIM原样)──────────────
+            mask_cpu = {k: v.cpu() for k, v in mask.items()}
+            x_r = {
+                k: torch.cat([
+                    emb_sh[k][mask_cpu[k]].detach().to(emb_u[k].device),
+                    emb_u[k][mask_cpu[k]],
+                ], dim=1)
+                for k in emb_u.keys()
+            }
+            x_r_prime = {
+                k: torch.cat([
+                    torch.roll(emb_sh[k][mask_cpu[k]].detach().to(emb_u[k].device), 1, 0),
+                    emb_u[k][mask_cpu[k]],
+                ], dim=1)
+                for k in emb_sh.keys()
+            }
+            u_loss = torch.tensor(0.0).to(self.device)
+            for m in x_r.keys():
+                if sum(mask_cpu[m]) <= 1:
+                    continue
+                fake_logits = self.discriminators[m](x_r[m])
+                u_loss += torch.nn.functional.binary_cross_entropy_with_logits(
+                    input=fake_logits, target=torch.ones_like(fake_logits)
+                ).to(self.device)
+
+            # ── 更新编码器(任务 + shared + unique)──────────────────
+            loss_encoders = (
+                task_loss
+                + self.cfg.aux_loss.alpha * sh_loss
+                + self.cfg.disentangled.gamma * u_loss
+            )
+            if split == "train":
+                self.optimizer.zero_grad()
+                loss_encoders.backward()
+                self.optimizer.step()
+
+            # ── 更新判别器 ─────────────────────────────────────────
+            for m in x_r.keys():
+                if sum(mask_cpu[m]) <= 1:
+                    continue
+                fake_logits = self.discriminators[m](x_r[m].detach())
+                real_logits = self.discriminators[m](x_r_prime[m].detach())
+                loss_dsm = self.discriminator_loss(real_logits=real_logits,
+                                                   fake_logits=fake_logits)
+                if split == "train":
+                    self.optimizers_dsm[m].zero_grad()
+                    loss_dsm.backward()
+                    self.optimizers_dsm[m].step()
+                total_dsm_loss[m] += loss_dsm.item() * y.size(0)
+
+            bs = y.size(0)
+            total_task_loss += task_loss.item() * bs
+            total_sh_loss += sh_loss.item() * bs
+            total_u_loss += u_loss.item() * bs
+            n += bs
+            raw_logits.append(outputs.detach())
+            all_labels.append(y.detach())
+
+        out = {
+            "task_loss": total_task_loss / n,
+            "shared_loss": total_sh_loss / n,
+            "unique_loss": total_u_loss / n,
+        }
+        out.update({f"dsm_{k}": v / n for k, v in total_dsm_loss.items()})
+
+        if split != "train":
+            out.update(self.compute_cls_metrics(raw_logits, all_labels))
+        return out
+
+    # ── 覆盖 fit:按 val PRAUC 保存最佳模型 ──────────────────────────
+    def fit(self, epochs=None):
+        from drim.logger import logger
+        import torch
+        if epochs is None:
+            epochs = self.cfg.general.epochs
+
+        best_val_prauc = -1.0
+        best_val_auroc = -1.0
+        best_state = None
+        best_epoch = -1
+        patience = getattr(self.cfg.general, 'patience', 15)
+        no_improve = 0
+
+        for epoch in range(epochs):
+            logger.info(f"Epoch {epoch + 1}/{epochs}")
+            train_losses = self.shared_loop(split="train")
+            for k, v in train_losses.items():
+                logger.info(f"Train {k} {v:.4f}")
+
+            val_metrics = self.shared_loop(split="val")
+            for k, v in val_metrics.items():
+                logger.info(f"Val {k} {v:.4f}")
+
+            cur = val_metrics.get("PRAUC", -1.0)
+            if cur > best_val_prauc:
+                best_val_prauc = cur
+                best_val_auroc = val_metrics.get("AUROC", -1.0)
+                best_epoch = epoch + 1
+                best_state = {k: v.detach().cpu().clone()
+                              for k, v in self.model.state_dict().items()}
+                logger.info(f"  >> new best val PRAUC {best_val_prauc:.4f} @epoch {best_epoch}")
+                no_improve = 0
+            else:
+                no_improve += 1
+                logger.info(f"  no improve {no_improve}/{patience}")
+
+            self.scheduler.step()
+
+            if no_improve >= patience:
+                logger.info(f"Early stopping @epoch {epoch + 1} "
+                            f"(no improve for {patience} epochs)")
+                break
+
+        # 保存最佳并载回模型,供后续 test 评估
+        if best_state is not None:
+            torch.save(best_state, self.cfg.general.save_path)
+            self.model.load_state_dict(best_state)
+            logger.info(f"Best model @epoch {best_epoch}, "
+                        f"val PRAUC {best_val_prauc:.4f} AUROC {best_val_auroc:.4f}")
+
+        self.best_val_prauc = best_val_prauc
+        self.best_val_auroc = best_val_auroc

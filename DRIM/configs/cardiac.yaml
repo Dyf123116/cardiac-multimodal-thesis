@@ -1,0 +1,41 @@
+general:
+  seed: 1999
+  modalities: [EHR, ECG, TEXT]
+  n_outs: 6
+  dropout: 0.3
+  epochs: 50
+  dim: 256
+  save_path: ./models/drim_cardiac.pth
+
+dataloader:
+  batch_size: 32
+  pin_memory: true
+  num_workers: 8
+  persistent_workers: true
+
+fusion:
+  name: maf
+  params:
+    depth: 1
+    heads: 8
+    dim_head: 64
+    mlp_dim: 256
+
+optimizer:
+  name: AdamW
+  params:
+    lr: 1e-4
+    weight_decay: 1e-2
+
+scheduler:
+  T_max: 50
+  eta_min: 5e-6
+
+aux_loss:
+  name: contrastive
+  alpha: 1.0
+
+disentangled:
+  gamma: 0.8
+  dsm_lr: 1e-3
+  dsm_wd: 3e-4

@@ -1,0 +1,45 @@
+import torch
+from torch import nn
+
+
+class LearnablePositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, dropout: float = 0.1, max_len: int = 500):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        self.pe = nn.Parameter(torch.rand(1, max_len, d_model))
+        self.pe.data.uniform_(-0.1, 0.1)
+
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+
+class EHREncoder(nn.Module):
+    """
+    DRIM 风格的 EHR 编码器。
+    去掉了原 EHRTransformer 的 shared/distinct 分支，
+    只保留主干 + 全序列平均池化，输出单个 (B, embedding_dim) 向量。
+    shared/unique 的分离由 DRIM 框架（两个独立编码器+判别器）完成。
+
+    输入: (B, 48, input_size)   input_size=68 (17 ICU + 17 lab) * 2(值+mask)
+    输出: (B, embedding_dim)
+    """
+    def __init__(self, embedding_dim: int, dropout: float = 0.3,
+                 input_size: int = 68, n_head: int = 8,
+                 n_layers: int = 1, max_len: int = 350):
+        super().__init__()
+        self.emb = nn.Linear(input_size, embedding_dim)
+        self.pos_encoder = LearnablePositionalEncoding(embedding_dim, dropout=0, max_len=max_len)
+        layer = nn.TransformerEncoderLayer(
+            d_model=embedding_dim, nhead=n_head,
+            batch_first=True, dropout=dropout
+        )
+        self.model_feat = nn.TransformerEncoder(layer, num_layers=n_layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, 48, input_size)，EHR 定长48小时，全序列参与
+        x = self.emb(x)
+        x = self.pos_encoder(x)
+        feat = self.model_feat(x)            # (B, 48, embedding_dim)
+        rep = feat.mean(dim=1)               # 全序列平均池化 → (B, embedding_dim)
+        return rep
